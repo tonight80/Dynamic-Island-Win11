@@ -1,0 +1,518 @@
+// Dynamic Island for Windows — UI.
+//
+// The native window is a fixed transparent canvas; the black "pill" morphs
+// inside it. Rust clips the window's hit-region to the pill so the rest of
+// the canvas never blocks clicks.
+
+export struct LyricLine {
+    text: string,
+    time: int,
+}
+
+// Spring-like overshoot used for every shape change.
+global Motion {
+    out property <easing> spring: cubic-bezier(0.32, 1.28, 0.42, 1.0);
+    out property <duration> morph: 520ms;
+}
+
+global Icons {
+    out property <string> play: "M8 5.14v13.72a1 1 0 0 0 1.5.86l11-6.86a1 1 0 0 0 0-1.72l-11-6.86A1 1 0 0 0 8 5.14z";
+    out property <string> pause: "M6.5 4h3a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1h-3a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zm8 0h3a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1h-3a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z";
+    out property <string> next: "M2.5 6.2v11.6a.8.8 0 0 0 1.25.66L12 12.66v5.14a.8.8 0 0 0 1.25.66l8.5-5.8a.8.8 0 0 0 0-1.32l-8.5-5.8A.8.8 0 0 0 12 6.2v5.14L3.75 5.54A.8.8 0 0 0 2.5 6.2z";
+    out property <string> prev: "M21.5 6.2v11.6a.8.8 0 0 1-1.25.66L12 12.66v5.14a.8.8 0 0 1-1.25.66l-8.5-5.8a.8.8 0 0 1 0-1.32l8.5-5.8A.8.8 0 0 1 12 6.2v5.14l8.25-5.8a.8.8 0 0 1 1.25.66z";
+    out property <string> lyrics: "M4 3h16a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H9l-4.3 3.4A1 1 0 0 1 3 20.6V5a2 2 0 0 1 1-2zm3 5a1 1 0 0 0 0 2h10a1 1 0 1 0 0-2H7zm0 4a1 1 0 0 0 0 2h6a1 1 0 1 0 0-2H7z";
+    out property <string> note: "M18 3v11.5a3.5 3.5 0 1 1-2-3.16V7.3l-7 1.75v7.45a3.5 3.5 0 1 1-2-3.16V5.5a1 1 0 0 1 .76-.97l9-2.25A1 1 0 0 1 18 3z";
+}
+
+component IconButton inherits Rectangle {
+    in property <string> icon;
+    in property <length> size: 40px;
+    in property <length> icon-size: 22px;
+    in property <bool> enabled: true;
+    in property <bool> active: false;
+    in property <color> tint: white;
+    callback clicked;
+
+    width: size;
+    height: size;
+    border-radius: size / 2;
+    background: ta.pressed ? #ffffff2e : ta.has-hover ? #ffffff17 : active ? #ffffff14 : transparent;
+    animate background { duration: 140ms; }
+
+    Path {
+        width: ta.pressed ? root.icon-size * 0.88 : root.icon-size;
+        height: self.width;
+        animate width { duration: 160ms; easing: Motion.spring; }
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: root.icon;
+        fill: !root.enabled ? #ffffff40 : root.active ? root.tint : #ffffffee;
+    }
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component Artwork inherits Rectangle {
+    in property <image> source;
+    in property <bool> has-art;
+    background: #2c2c2e;
+    clip: true;
+    Path {
+        width: parent.width * 0.45;
+        height: self.width;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: Icons.note;
+        fill: #ffffff55;
+        visible: !root.has-art;
+    }
+    Image {
+        width: parent.width;
+        height: parent.height;
+        source: root.source;
+        image-fit: cover;
+        opacity: root.has-art ? 1 : 0;
+        animate opacity { duration: 300ms; }
+    }
+}
+
+export component Island inherits Window {
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+    title: "Dynamic Island";
+    width: 520px;
+    height: 420px;
+    default-font-family: "Segoe UI Variable Display";
+
+    // ---- data from Rust ----
+    in property <bool> has-media;
+    in property <bool> playing;
+    in property <image> art;
+    in property <bool> has-art;
+    in property <color> accent: #9be7b4;
+    in property <string> track-title;
+    in property <string> track-artist;
+    in property <string> source-name;
+    in property <int> position-ms;
+    in property <int> duration-ms;
+    in property <bool> can-seek;
+    in property <bool> can-next: true;
+    in property <bool> can-prev: true;
+
+    in property <[LyricLine]> lyrics;
+    in property <int> lyric-index: -1;
+    in property <bool> lyrics-synced;
+    in property <string> lyrics-status;
+    in property <string> lyrics-source;
+
+    // ---- settings ----
+    in property <bool> visualizer: true;
+    in property <bool> compact-lyrics: true;
+    in property <bool> expand-on-hover: true;
+    in property <length> top-offset: 8px;
+
+    in-out property <bool> show-lyrics: false;
+
+    callback play-pause();
+    callback next();
+    callback prev();
+    callback seek(int);
+    callback shape-changed();
+    pure callback format-time(int) -> string;
+
+    // ---- state ----
+    property <bool> pinned: false;
+    property <bool> hover-expanded: false;
+    property <bool> hovering: body.has-hover;
+    property <bool> expanded: has-media && (pinned || (expand-on-hover && hover-expanded));
+    property <string> current-line: lyrics-synced && lyric-index >= 0 && lyric-index < lyrics.length ? lyrics[lyric-index].text : "";
+    property <bool> compact-shows-lyric: compact-lyrics && playing && current-line != "";
+
+    // "Tucked": an app window sits under the island (e.g. a maximised
+    // browser), so it shrinks to a thin handle at the screen edge. Hovering
+    // the handle opens the full player; `peek` briefly shows it on track change.
+    in property <bool> tucked;
+    in property <bool> peek;
+    property <bool> is-tucked: tucked && !peek && !expanded && has-media;
+
+    out property <length> pill-width: !has-media ? 150px : expanded ? 440px : is-tucked ? 130px : compact-shows-lyric ? 380px : 320px;
+    out property <length> pill-height: !has-media ? 36px : expanded ? (show-lyrics ? 390px : 188px) : is-tucked ? 6px : 38px;
+    // While tucked the island hugs the screen edge in every state, so the
+    // cursor that opened it from the handle stays inside it.
+    out property <length> pill-top: tucked && has-media ? 1px : top-offset;
+
+    changed pill-width => { root.shape-changed(); }
+    changed pill-height => { root.shape-changed(); }
+    changed pill-top => { root.shape-changed(); }
+    changed has-media => { if (!has-media) { pinned = false; } }
+    changed hovering => { if (!hovering) { hover-block = false; } }
+
+    property <bool> hover-block: false;
+    property <bool> want-hover: hovering && !hover-block;
+
+    // Small hover intent delays so the island doesn't flicker when the
+    // cursor just passes by.
+    Timer {
+        interval: root.want-hover ? 140ms : 420ms;
+        running: root.want-hover != root.hover-expanded;
+        triggered => { root.hover-expanded = root.want-hover; }
+    }
+
+    // Toggled from Rust after the window's hit-region changes: the software
+    // renderer only repaints dirty areas, and newly exposed parts of the
+    // window would otherwise stay empty. Flipping this invisible full-window
+    // rectangle marks everything dirty for one frame.
+    in property <bool> repaint-all;
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: root.repaint-all ? #00000001 : #00000000;
+    }
+
+    pill := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: root.pill-top;
+        animate y { duration: Motion.morph; easing: Motion.spring; }
+        width: root.pill-width;
+        height: root.pill-height;
+        animate width, height { duration: Motion.morph; easing: Motion.spring; }
+        border-radius: root.expanded ? 40px : root.is-tucked ? 3px : 19px;
+        animate border-radius { duration: Motion.morph; easing: Motion.spring; }
+        // A dark-grey handle stays visible on dark app themes.
+        background: root.is-tucked ? #48484a : #000000;
+        animate background { duration: 250ms; }
+        drop-shadow-blur: 10px;
+        drop-shadow-offset-y: 2px;
+        drop-shadow-color: root.expanded ? #00000070 : #00000040;
+        clip: true;
+
+        body := TouchArea {
+            // Click on a collapsed island opens (and pins) it. Clicks inside
+            // an open island never close it (buttons would bubble here);
+            // closing is done via the header or by moving the cursor away.
+            clicked => {
+                if (root.has-media && !root.expanded) {
+                    root.pinned = true;
+                }
+            }
+
+            // ---------- compact ----------
+            compact := Rectangle {
+                width: root.pill-width;
+                height: 38px;
+                x: (parent.width - self.width) / 2;
+                y: 0;
+                opacity: root.has-media && !root.expanded && !root.is-tucked ? 1 : 0;
+                animate opacity { duration: 180ms; }
+                visible: self.opacity > 0.01;
+
+                Artwork {
+                    x: 7px;
+                    y: 6px;
+                    width: 26px;
+                    height: 26px;
+                    border-radius: 8px;
+                    source: root.art;
+                    has-art: root.has-art;
+                }
+
+                Text {
+                    x: 42px;
+                    width: parent.width - 42px - 44px;
+                    height: parent.height;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                    overflow: elide;
+                    font-size: 13px;
+                    font-weight: root.compact-shows-lyric ? 600 : 500;
+                    color: root.compact-shows-lyric ? #ffffff : #ffffffcc;
+                    text: root.compact-shows-lyric ? root.current-line : root.track-title;
+                }
+
+                // Equalizer bars. animation-tick() is only read while playing,
+                // so nothing redraws when paused.
+                Rectangle {
+                    x: parent.width - 34px;
+                    width: 20px;
+                    height: parent.height;
+                    for idx in 4: Rectangle {
+                        x: idx * 5.5px;
+                        width: 3px;
+                        border-radius: 1.5px;
+                        background: root.accent;
+                        height: (root.playing && root.visualizer && compact.visible
+                            ? 0.25 + 0.75 * Math.abs(Math.sin((animation-tick() / 1ms) * (0.21 + idx * 0.07) * 1deg + idx * 47deg))
+                            : 0.22) * 16px;
+                        y: (parent.height - self.height) / 2;
+                    }
+                }
+            }
+
+            // ---------- expanded ----------
+            expanded-view := Rectangle {
+                width: 440px;
+                height: root.pill-height;
+                x: (parent.width - self.width) / 2;
+                y: 0;
+                opacity: root.expanded ? 1 : 0;
+                animate opacity { duration: 240ms; delay: 60ms; }
+                visible: self.opacity > 0.01;
+
+                Artwork {
+                    x: 22px;
+                    y: 22px;
+                    width: 68px;
+                    height: 68px;
+                    border-radius: 16px;
+                    source: root.art;
+                    has-art: root.has-art;
+                }
+
+                VerticalLayout {
+                    x: 104px;
+                    y: 22px;
+                    width: parent.width - 104px - 76px;
+                    height: 68px;
+                    alignment: center;
+                    spacing: 1px;
+                    Text {
+                        text: root.track-title;
+                        color: white;
+                        font-size: 17px;
+                        font-weight: 700;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: root.track-artist;
+                        color: #ffffff99;
+                        font-size: 14px;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: root.source-name;
+                        color: #ffffff4d;
+                        font-size: 11px;
+                        overflow: elide;
+                        visible: root.source-name != "";
+                    }
+                }
+
+                // Clicking the header (art + title) collapses the island.
+                TouchArea {
+                    x: 22px;
+                    y: 22px;
+                    width: parent.width - 22px - 76px;
+                    height: 68px;
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.pinned = false;
+                        root.hover-expanded = false;
+                        root.hover-block = true;
+                    }
+                }
+
+                IconButton {
+                    x: parent.width - 22px - self.width;
+                    y: 36px;
+                    size: 40px;
+                    icon-size: 21px;
+                    icon: Icons.lyrics;
+                    active: root.show-lyrics;
+                    tint: root.accent;
+                    clicked => { root.show-lyrics = !root.show-lyrics; }
+                }
+
+                // ---------- lyrics ----------
+                lyr := Rectangle {
+                    x: 22px;
+                    y: 104px;
+                    width: parent.width - 44px;
+                    height: Math.max(0px, parent.height - 104px - 100px);
+                    clip: true;
+                    opacity: root.show-lyrics ? 1 : 0;
+                    animate opacity { duration: 220ms; }
+                    visible: self.opacity > 0.01 && self.height > 10px;
+
+                    property <length> line-h: 54px;
+
+                    if root.lyrics-synced && root.lyrics.length > 0: Rectangle {
+                        width: parent.width;
+                        height: root.lyrics.length * lyr.line-h;
+                        y: lyr.height * 0.36 - lyr.line-h / 2 - Math.max(root.lyric-index, 0) * lyr.line-h;
+                        animate y { duration: 520ms; easing: cubic-bezier(0.22, 0.9, 0.3, 1.0); }
+
+                        for line[i] in root.lyrics: Rectangle {
+                            y: i * lyr.line-h;
+                            width: parent.width;
+                            height: lyr.line-h;
+                            Text {
+                                width: parent.width;
+                                height: parent.height;
+                                text: line.text == "" ? "♪" : line.text;
+                                wrap: word-wrap;
+                                overflow: elide;
+                                vertical-alignment: center;
+                                font-size: 17px;
+                                font-weight: 700;
+                                color: i == root.lyric-index ? #ffffff : lt.has-hover ? #ffffff80 : #ffffff38;
+                                animate color { duration: 280ms; }
+                            }
+                            lt := TouchArea {
+                                mouse-cursor: pointer;
+                                enabled: root.can-seek && line.time >= 0;
+                                clicked => { root.seek(line.time); }
+                            }
+                        }
+                    }
+
+                    if !root.lyrics-synced && root.lyrics.length > 0: Flickable {
+                        width: parent.width;
+                        height: parent.height;
+                        content-height: plain.preferred-height + 40px;
+                        plain := VerticalLayout {
+                            padding-top: 16px;
+                            padding-bottom: 24px;
+                            spacing: 4px;
+                            for line in root.lyrics: Text {
+                                text: line.text;
+                                wrap: word-wrap;
+                                font-size: 16px;
+                                font-weight: 600;
+                                color: #ffffffb0;
+                            }
+                        }
+                    }
+
+                    if root.lyrics-status != "": Text {
+                        width: parent.width;
+                        height: parent.height;
+                        text: root.lyrics-status;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        font-size: 14px;
+                        color: #ffffff66;
+                    }
+
+                    // Soft fade at the edges.
+                    Rectangle {
+                        y: 0;
+                        height: 22px;
+                        background: @linear-gradient(180deg, #000000 0%, #00000000 100%);
+                    }
+                    Rectangle {
+                        y: parent.height - self.height;
+                        height: 22px;
+                        background: @linear-gradient(0deg, #000000 0%, #00000000 100%);
+                    }
+                    Text {
+                        x: parent.width - self.width;
+                        y: parent.height - self.height - 2px;
+                        text: root.lyrics-source;
+                        font-size: 10px;
+                        color: #ffffff38;
+                    }
+                }
+
+                // ---------- progress ----------
+                prog := Rectangle {
+                    x: 22px;
+                    y: parent.height - 94px;
+                    width: parent.width - 44px;
+                    height: 34px;
+
+                    property <bool> dragging: false;
+                    property <float> drag-frac: 0;
+                    property <float> frac: dragging ? drag-frac : root.duration-ms > 0 ? Math.min(1, root.position-ms / root.duration-ms) : 0;
+                    property <int> shown-ms: dragging ? Math.round(drag-frac * root.duration-ms) : root.position-ms;
+
+                    track := Rectangle {
+                        y: 6px;
+                        height: seek-ta.has-hover || prog.dragging ? 8px : 5px;
+                        animate height { duration: 160ms; easing: Motion.spring; }
+                        border-radius: self.height / 2;
+                        background: #ffffff2b;
+                        Rectangle {
+                            x: 0;
+                            width: parent.width * prog.frac;
+                            height: parent.height;
+                            border-radius: parent.border-radius;
+                            background: seek-ta.has-hover || prog.dragging ? #ffffff : #ffffffd9;
+                        }
+                    }
+
+                    seek-ta := TouchArea {
+                        height: 20px;
+                        y: 0;
+                        enabled: root.can-seek;
+                        mouse-cursor: root.can-seek ? pointer : default;
+                        pointer-event(ev) => {
+                            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                                prog.dragging = true;
+                                prog.drag-frac = Math.max(0, Math.min(1, self.mouse-x / self.width));
+                            } else if (ev.kind == PointerEventKind.up && prog.dragging) {
+                                prog.dragging = false;
+                                root.seek(Math.round(prog.drag-frac * root.duration-ms));
+                            }
+                        }
+                        moved => {
+                            if (prog.dragging) {
+                                prog.drag-frac = Math.max(0, Math.min(1, self.mouse-x / self.width));
+                            }
+                        }
+                    }
+
+                    Text {
+                        x: 0;
+                        y: 18px;
+                        text: root.format-time(prog.shown-ms);
+                        font-size: 11px;
+                        color: #ffffff70;
+                    }
+                    Text {
+                        x: parent.width - self.width;
+                        y: 18px;
+                        text: root.duration-ms > 0 ? "-" + root.format-time(root.duration-ms - prog.shown-ms) : "";
+                        font-size: 11px;
+                        color: #ffffff70;
+                    }
+                }
+
+                // ---------- controls ----------
+                controls := Rectangle {
+                    y: parent.height - 62px;
+                    width: parent.width;
+                    height: 50px;
+
+                    IconButton {
+                        x: parent.width / 2 - 78px - self.width / 2;
+                        icon: Icons.prev;
+                        size: 46px;
+                        icon-size: 26px;
+                        enabled: root.can-prev;
+                        clicked => { root.prev(); }
+                    }
+                    IconButton {
+                        x: (parent.width - self.width) / 2;
+                        icon: root.playing ? Icons.pause : Icons.play;
+                        size: 52px;
+                        icon-size: 32px;
+                        clicked => { root.play-pause(); }
+                    }
+                    IconButton {
+                        x: parent.width / 2 + 78px - self.width / 2;
+                        icon: Icons.next;
+                        size: 46px;
+                        icon-size: 26px;
+                        enabled: root.can-next;
+                        clicked => { root.next(); }
+                    }
+                }
+            }
+        }
+    }
+}
